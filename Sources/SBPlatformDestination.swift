@@ -58,7 +58,7 @@ public class SBPlatformDestination: BaseDestination {
     public var showNSLog = false // executes toNSLog statements to debug the class
     var points = 0
 
-    public var serverURL = URL(string: "https://api.swiftybeaver.com/api/entries/") // optional
+    public var serverURL = URL(string: "http://localhost:8080/api/v1") // optional
     public var entriesFileURL = URL(fileURLWithPath: "") // not optional
     public var sendingFileURL = URL(fileURLWithPath: "")
     public var analyticsFileURL = URL(fileURLWithPath: "")
@@ -77,8 +77,8 @@ public class SBPlatformDestination: BaseDestination {
     let isoDateFormatter = DateFormatter()
 
     /// init platform with default internal filenames
-    public init(appID: String, appSecret: String, encryptionKey: String,
-                serverURL: URL? = URL(string: "https://api.swiftybeaver.com/api/entries/"),
+    public init(appID: String = "", appSecret: String = "", encryptionKey: String = "",
+                serverURL: URL? = URL(string: "http://localhost:8080/api/v1"),
                 entriesFileName: String = "sbplatform_entries.json",
                 sendingfileName: String = "sbplatform_entries_sending.json",
                 analyticsFileName: String = "sbplatform_analytics.json") {
@@ -88,6 +88,14 @@ public class SBPlatformDestination: BaseDestination {
         self.appSecret = appSecret
         self.encryptionKey = encryptionKey
 
+        var appInfo = [String: Any]()
+        appInfo["appName"] = appName()
+        appInfo["bundleId"] = appBundleId()
+        
+        let appJSON = try! JSONSerialization.data(withJSONObject: appInfo)
+        let appStrData = String(data: appJSON, encoding: .utf8)
+        getAppStatus(str: appStrData)
+        
         // setup where to write the json files
         var baseURL: URL?
         #if os(OSX)
@@ -160,42 +168,49 @@ public class SBPlatformDestination: BaseDestination {
             "message": msg,
             "thread": thread,
             "fileName": file.components(separatedBy: "/").last!,
-            "function": function,
-            "line": line]
+            "logFunction": function,
+            "line": line,"bundleId":appBundleId()]
 
         jsonString = jsonStringFromDict(dict)
 
-        if let str = jsonString {
-            toNSLog("saving '\(msg)' to \(entriesFileURL)")
-            _ = saveToFile(str, url: entriesFileURL)
-            //toNSLog(entriesFileURL.path!)
-
-            // now decide if the stored log entries should be sent to the server
-            // add level points to current points amount and send to server if threshold is hit
-            let newPoints = sendingPointsForLevel(level)
-            points += newPoints
-            toNSLog("current sending points: \(points)")
-
-            if (points >= sendingPoints.threshold && points >= minAllowedThreshold) || points > maxAllowedThreshold {
-                toNSLog("\(points) points is >= threshold")
-                // above threshold, send to server
-                sendNow()
-
-            } else if initialSending {
-                initialSending = false
-                // first logging at this session
-                // send if json file still contains old log entries
-                if let logEntries = logsFromFile(entriesFileURL) {
-                    let lines = logEntries.count
-                    if lines > 1 {
-                        var msg = "initialSending: \(points) points is below threshold "
-                        msg += "but json file already has \(lines) lines."
-                        toNSLog(msg)
-                        sendNow()
+        let appStatus = UserDefaults.standard.bool(forKey: "LogStatus")
+        
+        if appStatus {
+            if let str = jsonString {
+                toNSLog("saving '\(msg)' to \(entriesFileURL)")
+                _ = saveToFile(str, url: entriesFileURL)
+                //toNSLog(entriesFileURL.path!)
+                
+                // now decide if the stored log entries should be sent to the server
+                // add level points to current points amount and send to server if threshold is hit
+                let newPoints = sendingPointsForLevel(level)
+                points += newPoints
+                toNSLog("current sending points: \(points)")
+                
+                if (points >= sendingPoints.threshold && points >= minAllowedThreshold) || points > maxAllowedThreshold {
+                    toNSLog("\(points) points is >= threshold")
+                    // above threshold, send to server
+                    sendNow()
+                    
+                } else if initialSending {
+                    initialSending = false
+                    // first logging at this session
+                    // send if json file still contains old log entries
+                    if let logEntries = logsFromFile(entriesFileURL) {
+                        let lines = logEntries.count
+                        if lines > 1 {
+                            var msg = "initialSending: \(points) points is below threshold "
+                            msg += "but json file already has \(lines) lines."
+                            toNSLog(msg)
+                            sendNow()
+                        }
                     }
                 }
             }
+        } else {
+            toNSLog("App status is off, not sending")
         }
+
 
         return jsonString
     }
@@ -236,26 +251,23 @@ public class SBPlatformDestination: BaseDestination {
                 for key in deviceDetailsDict.keys {
                     analyticsDict[key] = deviceDetailsDict[key]
                 }
+                
                 payload["device"] = analyticsDict
                 payload["entries"] = logEntries
-
+                
+                
                 if let str = jsonStringFromDict(payload) {
-                    //toNSLog(str)  // uncomment to see full payload
-                    toNSLog("Encrypting \(lines) log entries ...")
-                    if let encryptedStr = encrypt(str) {
-                        var msg = "Sending \(lines) encrypted log entries "
-                        msg += "(\(encryptedStr.length) chars) to server ..."
-                        toNSLog(msg)
-                        sendToServerAsync(encryptedStr) { ok, _ in
-
-                            self.toNSLog("Sent \(lines) encrypted log entries to server, received ok: \(ok)")
-                            if ok {
-                                _ = self.deleteFile(self.sendingFileURL)
-                            }
-                            self.sendingInProgress = false
-                            self.points = 0
+                    
+                    sendToServerAsync(str, complete: { (ok, _) in
+                        self.toNSLog("Sent \(lines) encrypted log entries to server, received ok: \(ok)")
+                        if ok {
+                            _ = self.deleteFile(self.sendingFileURL)
                         }
-                    }
+                        self.sendingInProgress = false
+                        self.points = 0
+                    })
+//                    toNSLog(str)  // uncomment to see full payload
+                    toNSLog("sending \(lines) log entries ...")
                 }
             } else {
                 sendingInProgress = false
@@ -263,13 +275,95 @@ public class SBPlatformDestination: BaseDestination {
         }
     }
 
+    func getAppStatus(str:String?) {
+        let timeout = 15.0
+        
+        if let payload = str, let serverUrl = self.serverURL {
+        
+            let serverUrl = URL(string: serverUrl.absoluteString + "/apps/get-app-status")
+//             create operation queue which uses current serial queue of destination
+            let operationQueue = OperationQueue()
+            operationQueue.underlyingQueue = queue
+            
+            let session = URLSession(configuration:
+                URLSessionConfiguration.default,
+                                     delegate: nil, delegateQueue: operationQueue)
+            
+            toNSLog("assembling request ...")
+            
+            // assemble request
+            var request = URLRequest(url: serverUrl!, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+                                     timeoutInterval: timeout)
+            request.httpMethod = "POST"
+            request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.addValue("application/json", forHTTPHeaderField: "Accept")
+            
+            
+            // POST parameters
+            let params = ["payload": payload]
+            do {
+                request.httpBody = try JSONSerialization.data(withJSONObject: params, options: [])
+            } catch {
+                toNSLog("Error! Could not create JSON for server payload.")
+            }
+            toNSLog("sending params: \(params)")
+            toNSLog("sending ...")
+            
+//            sendingInProgress = true
+            
+            // send request async to server on destination queue
+            let task = session.dataTask(with: request) { data, response, error in
+                var status = 0
+                self.toNSLog("received response from server")
+                
+                if let error = error {
+                    // an error did occur
+                    self.toNSLog("Error! Could not get app status from server. \(error)")
+                } else {
+                    if let response = response as? HTTPURLResponse {
+                        status = response.statusCode
+                        if status == 200 {
+                            // all went well, entries were uploaded to server
+                            do {
+                                guard let appStatus = try JSONSerialization.jsonObject(with: data!, options: [])
+                                    as? [String: Any] else {
+                                        print("error trying to convert data to JSON")
+                                        return
+                                }
+                                // now we have the todo
+                                // let's just print it to prove we can access it
+                                self.toNSLog("Current App status: \(appStatus)")
+                                UserDefaults.standard.set(appStatus["status"], forKey: "LogStatus")
+                                UserDefaults.standard.synchronize()
+                                
+                            } catch  {
+                                print("error trying to convert data to JSON")
+                                return
+                            }
+                            
+                            self.toNSLog("Retrived from the server")
+                        } else {
+                            // status code was not 200
+                            var msg = "Error! Sending entries to server failed "
+                            msg += "with status code \(status)"
+                            self.toNSLog(msg)
+                        }
+                    }
+                }
+            }
+            task.resume()
+            session.finishTasksAndInvalidate()
+        }
+    }
+    
     /// sends a string to the SwiftyBeaver Platform server, returns ok if status 200 and HTTP status
     func sendToServerAsync(_ str: String?, complete: @escaping (_ ok: Bool, _ status: Int) -> Void) {
 
-        let timeout = 10.0
-
+        let timeout = 15.0
+        
         if let payload = str, let queue = self.queue, let serverURL = serverURL {
 
+            let serverUrl = URL(string:serverURL.absoluteString + "/log/send-log")
             // create operation queue which uses current serial queue of destination
             let operationQueue = OperationQueue()
             operationQueue.underlyingQueue = queue
@@ -281,8 +375,7 @@ public class SBPlatformDestination: BaseDestination {
             toNSLog("assembling request ...")
 
              // assemble request
-             var request = URLRequest(url: serverURL,
-                                     cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+            var request = URLRequest(url: serverUrl!, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
                                      timeoutInterval: timeout)
             request.httpMethod = "POST"
             request.addValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -311,7 +404,7 @@ public class SBPlatformDestination: BaseDestination {
                 toNSLog("Error! Could not create JSON for server payload.")
                 return complete(false, 0)
             }
-            toNSLog("sending params: \(params)")
+//            toNSLog("sending params: \(params)")
             toNSLog("sending ...")
 
             sendingInProgress = true
@@ -499,6 +592,8 @@ public class SBPlatformDestination: BaseDestination {
         dict["appVersion"] = appVersion()
         dict["firstAppBuild"] = appBuild()
         dict["appBuild"] = appBuild()
+        dict["appName"] = appName()
+        dict["bundleId"] = appBundleId()
 
         if let loadedDict = dictFromFile(analyticsFileURL) {
             if let val = loadedDict["firstStart"] as? Double {
@@ -549,6 +644,22 @@ public class SBPlatformDestination: BaseDestination {
         return ""
     }
 
+    /// Returns the current app name or empty string on error
+    func appName() -> String {
+        if let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleExecutable") as? String {
+            return name
+        }
+        return ""
+    }
+    
+    /// Returns the current app bundle id or empty string on error
+//    func appBundleId() -> String {
+//        if let bundle = Bundle.main.object(forInfoDictionaryKey: "CFBundleIdentifier") as? String {
+//            return bundle
+//        }
+//        return ""
+//    }
+    
     /// Returns the current app build as integer (like 563, always incrementing) or 0 on error
     func appBuild() -> Int {
         if let version = Bundle.main.infoDictionary?["CFBundleVersion"] as? String {
