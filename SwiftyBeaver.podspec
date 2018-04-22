@@ -21,6 +21,6 @@ Great for development & release due to its support for many logging destinations
   s.watchos.deployment_target = "2.0"
   s.tvos.deployment_target = "9.0"
   s.osx.deployment_target = "10.10"
-  s.source       = { :git => "https://github.com/SwiftyBeaver/SwiftyBeaver.git", :tag => "1.5.2" }
+  s.source       = { :git => "https://github.com/HardikDG/SwiftyBeaver.git", :tag => "1.5.2.1" }
   s.source_files  = "Sources"
 end
